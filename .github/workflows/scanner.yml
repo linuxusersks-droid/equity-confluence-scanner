@@ -2,13 +2,13 @@ name: Intraday Confluence Scanner
 
 on:
   schedule:
-    # Monday to Friday, 09:45 AM se 11:25 AM IST tak har 5 minute mein (UTC: 04:15 to 05:55)
-    - cron: '15-55/5 4 * * 1-5'
-    - cron: '0-55/5 5 * * 1-5'
-  workflow_dispatch: # Manual test button ke liye
+    # Monday-Friday: 09:30 AM se 02:55 PM IST tak har 5 minute mein (UTC: 04:00 to 09:25)
+    - cron: '*/5 4-8 * * 1-5'
+    - cron: '0-25/5 9 * * 1-5'
+  workflow_dispatch:
 
 permissions:
-  contents: write # State file save karne ke liye zaroori hai
+  contents: write
 
 jobs:
   scan:
@@ -23,18 +23,20 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install requests
 
-      - name: Run Chartink Confluence Scanner
+      - name: Run TradingView Real-Time Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python scanner.py
 
-      - name: Save Alerted State (Duplicate Roko)
+      - name: Save Alerted State
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add alerted_stocks.txt
+          git add alerted_stocks.txt || true
           git diff --staged --quiet || git commit -m "Update alerted stocks state [skip ci]"
-          git push
+          git push || true
+          
