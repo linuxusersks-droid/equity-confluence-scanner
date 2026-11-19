@@ -74,22 +74,20 @@ def fetch_tradingview_intraday():
     if res.status_code == 200:
         return res.json().get("data", [])
     return []
-
 def main():
     ist_now = get_ist_now()
     today_str = ist_now.strftime("%Y-%m-%d")
     time_str = ist_now.strftime("%H:%M")
 
-    # FIX 1: Strict Python Time Guard (2:15 PM ke baad auto-alerts band)
-    if EVENT_NAME != "workflow_dispatch" and not ("09:25" <= time_str <= "14:15"):
-        print(f"[{time_str} IST] Outside Intraday Entry Window (09:25 - 14:15). Skipping.")
+    # Strict Time Guard: Sirf 09:25 AM se 02:15 PM IST ke beech hi chalega
+    if not ("09:25" <= time_str <= "14:15"):
+        print(f"[{time_str} IST] Outside Intraday Window (09:25 - 14:15). Skipping.")
         return
 
     alerted = load_state(today_str)
     rows = fetch_tradingview_intraday()
 
     new_alerts = []
-    top_rvol_preview = []
 
     for item in rows:
         d = item.get("d", [])
@@ -108,23 +106,19 @@ def main():
         low_5m = float(low_5m)
         high_5m = float(high_5m)
 
-        if len(top_rvol_preview) < 3:
-            top_rvol_preview.append(f"• <b>{sym}</b>: ₹{cmp_p} ({chg}%) | 5m VWAP: ₹{vwap_5m} | RVOL: {rvol}x")
-
         if rvol < 1.3:
             continue
 
         vwap_dist_pct = ((cmp_p - vwap_5m) / vwap_5m) * 100
 
-        # FIX 2 & 3: BULLISH PULLBACK + GREEN 5M BOUNCE CONFIRMATION
-        # Condition: Day Trend Bullish + 5m Low touched near VWAP + Current 5m Candle is GREEN (cmp_p > open_5m) + Holding above 5m VWAP
+        # BULLISH PULLBACK + GREEN 5M BOUNCE CONFIRMATION
         if (
             chg >= 1.0
             and cmp_p > day_o
             and (0.02 <= vwap_dist_pct <= 0.45)
             and low_5m <= (vwap_5m * 1.003)
-            and cmp_p > open_5m  # Must be a GREEN 5m rejection candle (No falling knife!)
-            and cmp_p < (day_h * 0.997) # Not at exact top, genuine pullback from Day High
+            and cmp_p > open_5m
+            and cmp_p < (day_h * 0.997)
         ):
             key = f"BULL_{sym}"
             if key not in alerted:
@@ -145,7 +139,7 @@ def main():
             and cmp_p < day_o
             and (-0.45 <= vwap_dist_pct <= -0.02)
             and high_5m >= (vwap_5m * 0.997)
-            and cmp_p < open_5m  # Must be a RED 5m rejection candle
+            and cmp_p < open_5m
             and cmp_p > (day_l * 1.003)
         ):
             key = f"BEAR_{sym}"
@@ -164,15 +158,6 @@ def main():
     if new_alerts:
         header = f"⚡ <b>CONFIRMED 5m VWAP BOUNCE ({time_str} IST)</b> ⚡\n\n"
         send_telegram(header + "\n\n".join(new_alerts))
-    elif EVENT_NAME == "workflow_dispatch":
-        preview_txt = "\n".join(top_rvol_preview) if top_rvol_preview else "No data"
-        send_telegram(
-            f"✅ <b>5m VWAP DIAGNOSTIC ({time_str} IST)</b>\n\n"
-            f"Top 3 RVOL Stocks (Check 5m VWAP match with chart):\n{preview_txt}"
-        )
 
     save_state(today_str, alerted)
-
-if __name__ == "__main__":
-    main()
-            
+    
