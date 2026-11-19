@@ -1,11 +1,11 @@
 name: Intraday Confluence Scanner
 
 on:
-  schedule:
-    # Monday-Friday: 09:30 AM se 02:55 PM IST tak har 5 minute mein (UTC: 04:00 to 09:25)
-    - cron: '*/5 4-8 * * 1-5'
-    - cron: '0-25/5 9 * * 1-5'
   workflow_dispatch:
+
+concurrency:
+  group: fno-scanner-run
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -29,7 +29,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python scanner.py
 
       - name: Save Alerted State
@@ -37,6 +36,4 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add alerted_stocks.txt || true
-          git diff --staged --quiet || git commit -m "Update alerted stocks state [skip ci]"
-          git push || true
-          
+          git diff --staged --quiet || (git commit -m "Update alerted stocks state [skip ci]" && git pull --rebase || true && git push || true)
