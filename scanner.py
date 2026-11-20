@@ -66,7 +66,7 @@ def get_fyers_token(today_str):
     totp_key = os.environ["FYERS_TOTP_KEY"].strip()
     pin = str(os.environ["FYERS_PIN"]).strip()
     app_id = os.environ["FYERS_APP_ID"].strip()
-    secret_id = os.environ["FYERS_SECRET_ID"].strip()
+    secret_key = os.environ["FYERS_SECRET_KEY"].strip()
     redirect_uri = "https://trade.fyers.in/api-login/redirect-uri/index.html"
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
