@@ -1,20 +1,16 @@
-name: Intraday Confluence Scanner
+name: Fyers 5m VWAP Scanner
 
 on:
-  workflow_dispatch:
-
-concurrency:
-  group: fno-scanner-run
-  cancel-in-progress: false
-
-permissions:
-  contents: write
+  workflow_dispatch:   # Manual test aur cron-job.org webhook ke liye
+  schedule:
+    - cron: '*/5 3-9 * * 1-5'   # Backup schedule (Mon-Fri, 08:30 - 15:25 IST)
 
 jobs:
-  scan:
+  run-scanner:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repo
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -23,17 +19,26 @@ jobs:
           python-version: '3.11'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: pip install -r requirements.txt
 
-      - name: Run TradingView Real-Time Scanner
+      - name: Cache Fyers Token & Alert State
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/fyers_access_token.txt
+            /tmp/alerted_stocks.txt
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
+      - name: Run Scanner
         env:
+          FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
+          FYERS_SECRET_ID: ${{ secrets.FYERS_SECRET_ID }}
+          FYERS_ID: ${{ secrets.FYERS_ID }}
+          FYERS_PIN: ${{ secrets.FYERS_PIN }}
+          FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
-
-      - name: Save Alerted State
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add alerted_stocks.txt || true
-          git diff --staged --quiet || (git commit -m "Update alerted stocks state [skip ci]" && git pull --rebase || true && git push || true)
+        
