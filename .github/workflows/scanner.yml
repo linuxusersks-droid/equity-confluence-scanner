@@ -18,8 +18,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
-        run: pip install -r requirements.txt
+            - name: Install Dependencies
+        run: pip install fyers-apiv3 pyotp pandas requests
+        
 
       - name: Cache Fyers Token & Alert State
         uses: actions/cache@v4
