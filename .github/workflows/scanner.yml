@@ -20,7 +20,6 @@ jobs:
 
       - name: Install Dependencies
         run: pip install fyers-apiv3 pyotp pandas requests
-        
 
       - name: Cache Fyers Token & Alert State
         uses: actions/cache@v4
@@ -35,11 +34,10 @@ jobs:
       - name: Run Scanner
         env:
           FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
-          FYERS_SECRET_ID: ${{ secrets.FYERS_SECRET_ID }}
+          FYERS_SECRET_ID: ${{ secrets.FYERS_SECRET_KEY }}
           FYERS_ID: ${{ secrets.FYERS_ID }}
           FYERS_PIN: ${{ secrets.FYERS_PIN }}
           FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
-        
