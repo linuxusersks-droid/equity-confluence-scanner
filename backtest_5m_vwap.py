@@ -23,6 +23,9 @@ def _b64(val: str) -> str:
 
 def get_fyers_token() -> str:
     fy_id = os.environ["FYERS_ID"].strip()
+        if "-" not in app_id:
+        app_id = f"{app_id}-100"
+            
     totp_key = os.environ["FYERS_TOTP_KEY"].strip()
     pin = str(os.environ["FYERS_PIN"]).strip()
     app_id = os.environ["FYERS_APP_ID"].strip()
