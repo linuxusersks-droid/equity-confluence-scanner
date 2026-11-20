@@ -21,21 +21,25 @@ def _b64(val: str) -> str:
     return base64.b64encode(str(val).encode()).decode()
 
 
+def get_app_id() -> str:
+    app_id = os.environ["FYERS_APP_ID"].strip()
+    if "-" not in app_id:
+        app_id = f"{app_id}-100"
+    return app_id
+
+
 def get_fyers_token() -> str:
     fy_id = os.environ["FYERS_ID"].strip()
-        if "-" not in app_id:
-        app_id = f"{app_id}-100"
-            
     totp_key = os.environ["FYERS_TOTP_KEY"].strip()
     pin = str(os.environ["FYERS_PIN"]).strip()
-    app_id = os.environ["FYERS_APP_ID"].strip()
+    app_id = get_app_id()
     secret_id = os.environ["FYERS_SECRET_ID"].strip()
     redirect_uri = "https://trade.fyers.in/api-login/redirect-uri/index.html"
 
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     s = requests.Session()
 
-    # Step 1: Send Login OTP (Base64 fy_id)
+    # Step 1: Send Login OTP
     r1 = s.post(
         "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
         json={"fy_id": _b64(fy_id), "app_id": "2"},
@@ -56,7 +60,7 @@ def get_fyers_token() -> str:
     if "request_key" not in r2:
         raise RuntimeError(f"Step 2 (verify_otp) failed: {r2}")
 
-    # Step 3: Verify PIN (Base64 pin)
+    # Step 3: Verify PIN
     r3 = s.post(
         "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
         json={"request_key": r2["request_key"], "identity_type": "pin", "identifier": _b64(pin)},
@@ -67,8 +71,7 @@ def get_fyers_token() -> str:
         raise RuntimeError(f"Step 3 (verify_pin_v2) failed: {r3}")
 
     auth_headers = {**headers, "authorization": f"Bearer {r3['data']['access_token']}"}
-    client_prefix = app_id.split("-")[0]
-    app_type = app_id.split("-")[1] if "-" in app_id else "100"
+    client_prefix, app_type = app_id.split("-", 1)
 
     # Step 4: Get Auth Code
     r4 = s.post(
@@ -269,7 +272,7 @@ def simulate_symbol(sym: str, df: pd.DataFrame) -> list[dict]:
 
 def main():
     now_ist = datetime.now(IST)
-    app_id = os.environ["FYERS_APP_ID"].strip()
+    app_id = get_app_id()
     token = get_fyers_token()
     print("Fyers login OK. Fetching 6-month 5m data...")
 
@@ -302,3 +305,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
