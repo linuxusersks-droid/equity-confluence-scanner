@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: '3.11'
 
-            - name: Install Dependencies
+      - name: Install Dependencies
         run: pip install fyers-apiv3 pyotp pandas requests
         
 
