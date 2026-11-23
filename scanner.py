@@ -128,7 +128,7 @@ def get_fyers_token(today_str):
 
     session_model = fyersModel.SessionModel(
         client_id=app_id,
-        secret_key=secret_id,
+        secret_key=secret_key,
         redirect_uri=redirect_uri,
         response_type="code",
         grant_type="authorization_code",
