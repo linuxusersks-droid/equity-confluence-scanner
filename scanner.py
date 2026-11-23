@@ -75,7 +75,7 @@ def get_fyers_token(today_str):
 
     r1 = s.post(
         "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-                json={"fy_id": base64.b64encode(fy_id.encode()).decode(), "app_id": "2"},
+        json={"fy_id": base64.b64encode(fy_id.encode()).decode(), "app_id": "2"},
         headers=headers,
         timeout=15,
     ).json()
@@ -94,7 +94,7 @@ def get_fyers_token(today_str):
 
     r3 = s.post(
         "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-                json={"request_key": r2["request_key"], "identity_type": "pin", "identifier": base64.b64encode(pin.encode()).decode()},
+        json={"request_key": r2["request_key"], "identity_type": "pin", "identifier": base64.b64encode(pin.encode()).decode()},
         headers=headers,
         timeout=15,
     ).json()
@@ -219,6 +219,15 @@ def main():
     alerted = load_state(today_str)
     fyers_syms = [f"NSE:{sym}-EQ" for sym in rvol_map.keys()]
 
+    # Nifty direction filter
+    nifty_chg = 0.0
+    try:
+        n_resp = fyers.quotes(data={"symbols": "NSE:NIFTY50-INDEX"})
+        if n_resp.get("s") == "ok":
+            nifty_chg = float(n_resp["d"][0]["v"].get("chp", 0))
+    except Exception as e:
+        print(f"Nifty fetch error: {e}")
+
     # STAGE 1: Real-Time Bulk Quotes (50 per call -> Max 2 calls)
     shortlisted = []
     for i in range(0, len(fyers_syms), 50):
@@ -244,8 +253,8 @@ def main():
                 continue
 
             # Directional pre-filter before calling history()
-            is_bull_cand = chg >= 1.0 and ltp > day_o and ltp < (day_h * 0.997)
-            is_bear_cand = chg <= -1.0 and ltp < day_o and ltp > (day_l * 1.003)
+            is_bull_cand = chg >= 1.0 and ltp > day_o and ltp < (day_h * 0.997) and nifty_chg > -0.2
+            is_bear_cand = chg <= -1.0 and ltp < day_o and ltp > (day_l * 1.003) and nifty_chg < 0.2
 
             if is_bull_cand or is_bear_cand:
                 shortlisted.append({
@@ -289,9 +298,14 @@ def main():
         df = pd.DataFrame(h_resp["candles"], columns=["ts", "open", "high", "low", "close", "volume"])
         df["time"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
 
-        # Lag Kill-Switch: 10 min se purani candle reject karo
+        # Sirf closed candles lo (running candle hatao)
+        df = df[df["time"] < last_closed]
+        if df.empty:
+            continue
+
+        # Lag Kill-Switch: 15 min se purani candle reject karo
         latest_time = df["time"].iloc[-1].to_pydatetime()
-        if (ist_now - latest_time).total_seconds() > 600:
+        if (ist_now - latest_time).total_seconds() > 900:
             continue
 
         # Exact Intraday VWAP
@@ -377,4 +391,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-                
+
+    
