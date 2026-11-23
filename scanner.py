@@ -1,3 +1,4 @@
+import base64
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -74,7 +75,7 @@ def get_fyers_token(today_str):
 
     r1 = s.post(
         "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
-        json={"fy_id": fy_id, "app_id": "2"},
+                json={"fy_id": base64.b64encode(fy_id.encode()).decode(), "app_id": "2"},
         headers=headers,
         timeout=15,
     ).json()
@@ -93,7 +94,7 @@ def get_fyers_token(today_str):
 
     r3 = s.post(
         "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
-        json={"request_key": r2["request_key"], "identity_type": "pin", "identifier": pin},
+                json={"request_key": r2["request_key"], "identity_type": "pin", "identifier": base64.b64encode(pin.encode()).decode()},
         headers=headers,
         timeout=15,
     ).json()
