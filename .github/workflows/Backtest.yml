@@ -32,3 +32,13 @@ jobs:
           FYERS_PIN: ${{ secrets.FYERS_PIN }}
           FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BACKTEST_DAYS: ${{ inputs.days }}
+        run: python backtest_5m_vwap.py
+
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: backtest_out/
