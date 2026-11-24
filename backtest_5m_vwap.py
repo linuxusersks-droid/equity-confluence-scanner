@@ -284,7 +284,7 @@ def fmt(s):
     return f"n={s['n']} win={s['win']:.0f}% avgR={s['avg']:+.2f} totR={s['tot']:+.1f} PF={pf} DD={s['dd']:.1f}R"
 
 
-def build_report(results, period_txt, n_syms):
+def build_report(results, period_txt, n_syms, split_date):
     lines = [f"BACKTEST {period_txt} | {n_syms} stocks | cost {COST_PCT}%", ""]
     for key, name, _ in VARIANTS:
         lines.append(f"{key} {name}: {fmt(stats(results[key]))}")
@@ -295,6 +295,27 @@ def build_report(results, period_txt, n_syms):
             lines.append(f" {b}: {fmt(stats([t for t in tr if t['bucket'] == b]))}")
         for sd in ("LONG", "SHORT"):
             lines.append(f" {sd}: {fmt(stats([t for t in tr if t['side'] == sd]))}")
+    # ---- Out-of-sample split: pehla hissa vs baad ka hissa
+    sd = str(split_date)
+    lines += ["", f"SPLIT: pehla hissa (< {sd}) vs baad ka hissa (>= {sd})"]
+    for key, name, _ in VARIANTS:
+        tr = results[key]
+        h1 = [t for t in tr if t["date"] < sd]
+        h2 = [t for t in tr if t["date"] >= sd]
+        lines.append(f"{key} {name}")
+        lines.append(f" H1: {fmt(stats(h1))}")
+        lines.append(f" H2: {fmt(stats(h2))}")
+    tr = results["C"]
+    combos = [
+        ("C + 10:30-12:00", lambda t: t["bucket"] == "10:30-12:00"),
+        ("C + SHORT", lambda t: t["side"] == "SHORT"),
+        ("C + SHORT + 10:30-12:00", lambda t: t["side"] == "SHORT" and t["bucket"] == "10:30-12:00"),
+    ]
+    for label, f in combos:
+        sel = [t for t in tr if f(t)]
+        lines.append(label)
+        lines.append(f" H1: {fmt(stats([t for t in sel if t['date'] < sd]))}")
+        lines.append(f" H2: {fmt(stats([t for t in sel if t['date'] >= sd]))}")
     lines += ["", "R = risk ke multiple. DD = max drawdown (R). PF = profit factor."]
     return "\n".join(lines)
 
@@ -344,12 +365,21 @@ def main():
         results[key] = tr
         pd.DataFrame(tr).to_csv(f"{OUT_DIR}/trades_{key}.csv", index=False)
 
-    report = build_report(results, f"{first_date} se {now.date()}", len(data))
+    split_date = first_date + (now.date() - first_date) / 2
+    report = build_report(results, f"{first_date} se {now.date()}", len(data), split_date)
     print(report)
     with open(f"{OUT_DIR}/summary.txt", "w") as f:
         f.write(report)
-    send_telegram(report[:4000])
+    chunk = ""
+    for ln in report.split("\n"):
+        if len(chunk) + len(ln) + 1 > 3800:
+            send_telegram(chunk)
+            chunk = ""
+        chunk += ln + "\n"
+    if chunk.strip():
+        send_telegram(chunk)
 
 
 if __name__ == "__main__":
     main()
+                           
