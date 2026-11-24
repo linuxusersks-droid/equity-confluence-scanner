@@ -1,12 +1,13 @@
 """
-5m VWAP scanner backtest (scanner.py ki logic ka replica).
-- Fyers se 5m candles leta hai, scanner ke 3 stage simulate karta hai
-- Alag-alag filter variants compare karta hai
+5m Opening Range Breakout (ORB) "Stocks in Play" backtest
+(Zarattini, Barbon & Aziz 2024 logic adapted for NSE 5m Fyers data).
+- Fyers se 5m candles leta hai (scanner.py ke get_fyers_token & send_telegram reuse karta hai)
+- Daily first 5m candle (09:15-09:20) ke RVOL par top Stocks-in-Play select karta hai
+- 5 filter/exit variants compare karta hai (A se E)
 - Summary Telegram par bhejta hai, trades CSV backtest_out/ me save karta hai
 """
 import html
 import os
-import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -15,12 +16,12 @@ import numpy as np
 import pandas as pd
 
 IST = timezone(timedelta(hours=5, minutes=30))
-OUT_DIR = "backtest_out"
+OUT_DIR = os.getenv("OUT_DIR", "backtest_out") or "backtest_out"
 COLS = ["ts", "open", "high", "low", "close", "volume"]
 
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "180") or "180")
 WARMUP_DAYS = 25
-COST_PCT = float(os.getenv("COST_PCT", "0.05") or "0.05")  # round-trip cost % (assumption)
+COST_PCT = float(os.getenv("COST_PCT", "0.05") or "0.05")  # round-trip cost %
 
 DEFAULT_SYMBOLS = [
     "RELIANCE", "TCS", "HDFCBANK", "ICICIBANK", "INFY", "SBIN", "BHARTIARTL",
@@ -35,11 +36,16 @@ DEFAULT_SYMBOLS = [
 ]
 
 VARIANTS = [
-    ("A", "Scanner (abhi wala)", dict(nifty=True, trend=False, sl_mode="scanner", tgt_r=2.5)),
-    ("B", "Bina Nifty filter", dict(nifty=False, trend=False, sl_mode="scanner", tgt_r=2.5)),
-    ("C", "Trend filter", dict(nifty=True, trend=True, sl_mode="scanner", tgt_r=2.5)),
-    ("D", "Wide SL + 2R", dict(nifty=True, trend=False, sl_mode="wide", tgt_r=2.0)),
-    ("E", "Trend + Wide SL + 2R", dict(nifty=True, trend=True, sl_mode="wide", tgt_r=2.0)),
+    ("A", "ORB Classic (RVOL>=1.5, OR-SL, EOD)",
+     dict(rvol=1.5, top_n=5, nifty=False, sl_mode="or", tgt_r=None, vwap_exit=False)),
+    ("B", "ORB ATR-SL (RVOL>=1.5, 0.25*ATR, EOD)",
+     dict(rvol=1.5, top_n=5, nifty=False, sl_mode="atr", tgt_r=None, vwap_exit=False)),
+    ("C", "ORB + 2.5R Target (RVOL>=1.5, OR-SL)",
+     dict(rvol=1.5, top_n=5, nifty=False, sl_mode="or", tgt_r=2.5, vwap_exit=False)),
+    ("D", "ORB Strict (RVOL>=2.0, Nifty, OR-SL, EOD)",
+     dict(rvol=2.0, top_n=5, nifty=True, sl_mode="or", tgt_r=None, vwap_exit=False)),
+    ("E", "ORB + VWAP Trail (RVOL>=1.5, Nifty, OR-SL)",
+     dict(rvol=1.5, top_n=5, nifty=True, sl_mode="or", tgt_r=None, vwap_exit=True)),
 ]
 
 
@@ -75,7 +81,7 @@ def fetch_5m(fyers, fy_sym, start_dt, end_dt):
         for _ in range(3):
             try:
                 resp = fyers.history(data=req)
-            except Exception as e:  # noqa
+            except Exception as e:
                 resp = {"s": "error", "message": str(e)}
             if resp.get("s") == "ok":
                 break
@@ -91,12 +97,24 @@ def fetch_5m(fyers, fy_sym, start_dt, end_dt):
     return prepare(pd.concat(frames))
 
 
-def daily_stats(df):
+def daily_orb_stats(df):
+    first_bar = df[df["smin"] == 555].groupby("date")["volume"].first()
     d = df.groupby("date").agg(
-        close=("close", "last"), vol=("volume", "sum"), n=("ts", "count")
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        vol=("volume", "sum"),
+        n=("ts", "count"),
     ).sort_index()
+    d["open5_vol"] = first_bar
     d["prev_close"] = d["close"].shift(1)
-    d["avg10"] = d["vol"].shift(1).rolling(10, min_periods=5).mean()
+    tr = pd.concat([
+        d["high"] - d["low"],
+        (d["high"] - d["prev_close"]).abs(),
+        (d["low"] - d["prev_close"]).abs(),
+    ], axis=1).max(axis=1)
+    d["atr14"] = tr.shift(1).rolling(14, min_periods=7).mean()
+    d["avg_open5_vol"] = d["open5_vol"].shift(1).rolling(14, min_periods=5).mean()
     return d
 
 
@@ -113,157 +131,184 @@ def build_nifty_map(ndf):
     return m
 
 
-# ---------------------------------------------------------------- records
-def build_records(data, nifty_map, first_date):
-    """Har symbol/din/candle ke liye stage 0-1 pass hone par record banata hai."""
-    records, days = [], {}
+# ---------------------------------------------------------------- setups
+def build_setups(data, nifty_map, first_date):
+    """Har din 09:15-09:20 candle close par RVOL aur OR direction calculate karta hai."""
+    setups, days = [], {}
     for sym, df in data.items():
-        ds = daily_stats(df)
+        ds = daily_orb_stats(df)
         for dt, g in df.groupby("date"):
             if dt < first_date or dt not in ds.index:
                 continue
             row = ds.loc[dt]
-            if (pd.isna(row["prev_close"]) or pd.isna(row["avg10"])
-                    or row["avg10"] <= 0 or row["prev_close"] <= 100 or len(g) < 60):
+            if (pd.isna(row["prev_close"]) or pd.isna(row["atr14"])
+                    or pd.isna(row["avg_open5_vol"]) or row["avg_open5_vol"] <= 0
+                    or row["atr14"] <= 0 or row["prev_close"] <= 100 or len(g) < 60):
                 continue
             g = g.reset_index(drop=True)
+            if int(g["smin"].iloc[0]) != 555:
+                continue
+            o0 = float(g["open"].iloc[0])
+            h0 = float(g["high"].iloc[0])
+            l0 = float(g["low"].iloc[0])
+            c0 = float(g["close"].iloc[0])
+            v0 = float(g["volume"].iloc[0])
+            if c0 == o0 or v0 <= 0 or h0 <= l0:
+                continue
+            rvol = v0 / float(row["avg_open5_vol"])
+            if rvol < 1.0:
+                continue
             arr = {k: g[k].to_numpy() for k in ("open", "high", "low", "close", "smin", "vwap")}
             days[(sym, dt)] = arr
-            cum_h = np.maximum.accumulate(arr["high"])
-            cum_l = np.minimum.accumulate(arr["low"])
-            cumvol = g["cumvol"].to_numpy()
-            day_o = arr["open"][0]
-            prev = row["prev_close"]
-            for i in range(len(g)):
-                scan_min = int(arr["smin"][i]) + 5
-                if scan_min < 565 or scan_min > 855:  # 09:25 - 14:15
-                    continue
-                elapsed = max(min((scan_min - 555) / 375.0, 1.0), 0.04)
-                proj = cumvol[i] / row["avg10"] / elapsed
-                if proj < 1.5:
-                    continue
-                ltp = arr["close"][i]
-                chg = (ltp - prev) / prev * 100
-                bull = chg >= 1.0 and ltp > day_o and ltp < cum_h[i] * 0.997
-                bear = chg <= -1.0 and ltp < day_o and ltp > cum_l[i] * 1.003
-                if not (bull or bear):
-                    continue
-                vw = arr["vwap"][i]
-                if np.isnan(vw) or vw <= 0:
-                    continue
-                o5, h5, l5 = arr["open"][i], arr["high"][i], arr["low"][i]
-                dist = (ltp - vw) / vw * 100
-                if bull:
-                    bias = "BULL"
-                    sig = 0.02 <= dist <= 0.45 and l5 <= vw * 1.003 and ltp > o5
-                else:
-                    bias = "BEAR"
-                    sig = -0.45 <= dist <= -0.02 and h5 >= vw * 0.997 and ltp < o5
-                trend_ok = False
-                if i >= 6:
-                    cl = arr["close"][i - 3:i + 1]
-                    vl = arr["vwap"][i - 3:i + 1]
-                    if bull:
-                        trend_ok = (cl > vl).sum() >= 3 and l5 > arr["low"][i - 6:i].min()
-                    else:
-                        trend_ok = (cl < vl).sum() >= 3 and h5 < arr["high"][i - 6:i].max()
-                lo3 = arr["low"][max(0, i - 2):i + 1].min()
-                hi3 = arr["high"][max(0, i - 2):i + 1].max()
-                records.append(dict(
-                    date=dt, scan_min=scan_min, sym=sym, bias=bias, proj=proj,
-                    sig=bool(sig), trend_ok=bool(trend_ok), i=i, entry=ltp,
-                    l5=l5, h5=h5, vwap=vw, sw_low=lo3, sw_high=hi3,
-                    nifty=nifty_map.get((dt, int(arr["smin"][i])), 0.0),
-                ))
-    return records, days
+            setups.append(dict(
+                date=dt,
+                sym=sym,
+                bias="BULL" if c0 > o0 else "BEAR",
+                rvol=rvol,
+                o0=o0,
+                h0=h0,
+                l0=l0,
+                c0=c0,
+                atr14=float(row["atr14"]),
+                nifty_open=nifty_map.get((dt, 555), 0.0),
+            ))
+    return setups, days
 
 
 # ---------------------------------------------------------------- simulate
-def bucket_of(scan_min):
-    if scan_min < 630:
-        return "09:25-10:30"
-    if scan_min < 720:
-        return "10:30-12:00"
-    return "12:00-14:15"
+def bucket_of(smin):
+    if smin < 585:
+        return "09:20-09:45"
+    if smin < 660:
+        return "09:45-11:00"
+    return "11:00-14:00"
 
 
-def simulate(r, arr, p):
-    entry, vw = r["entry"], r["vwap"]
-    side = 1 if r["bias"] == "BULL" else -1
-    if p["sl_mode"] == "scanner":
-        if side == 1:
-            sl0 = round(min(r["l5"], vw) * 0.997, 2)
-            risk = max(round(entry - sl0, 2), 0.5)
-        else:
-            sl0 = round(max(r["h5"], vw) * 1.003, 2)
-            risk = max(round(sl0 - entry, 2), 0.5)
-    else:
-        if side == 1:
-            base = min(r["sw_low"], vw) * 0.997
-            risk = max(entry - base, entry * 0.005)
-        else:
-            base = max(r["sw_high"], vw) * 1.003
-            risk = max(base - entry, entry * 0.005)
-    sl = entry - side * risk
-    tgt = entry + side * risk * p["tgt_r"]
-
-    exit_px, reason, last_close = None, "TIME", entry
+def simulate(s, arr, p):
+    side = 1 if s["bias"] == "BULL" else -1
+    trigger = s["h0"] if side == 1 else s["l0"]
     n = len(arr["close"])
-    for j in range(r["i"] + 1, n):
-        if arr["smin"][j] > 910:  # last candle start 15:10
+
+    entry_idx, entry_px = None, None
+    for j in range(1, n):
+        sm = int(arr["smin"][j])
+        if sm > 840:  # 14:00 ke baad naya breakout entry nahi
             break
-        lo, hi = arr["low"][j], arr["high"][j]
-        if side == 1:
-            if lo <= sl:
-                exit_px, reason = sl, "SL"
+        o = float(arr["open"][j])
+        hi = float(arr["high"][j])
+        lo = float(arr["low"][j])
+        if side == 1 and hi >= trigger:
+            entry_idx = j
+            entry_px = max(o, trigger)
+            break
+        if side == -1 and lo <= trigger:
+            entry_idx = j
+            entry_px = min(o, trigger)
+            break
+
+    if entry_idx is None:
+        return None
+
+    if p["sl_mode"] == "or":
+        sl0 = s["l0"] if side == 1 else s["h0"]
+        risk = max(abs(entry_px - sl0), entry_px * 0.0025, 0.5)
+    else:
+        risk = max(0.25 * s["atr14"], entry_px * 0.0025, 0.5)
+
+    sl = entry_px - side * risk
+    tgt = (entry_px + side * risk * p["tgt_r"]) if p["tgt_r"] else None
+
+    exit_px, reason = None, "EOD"
+    last_close = float(arr["close"][entry_idx])
+
+    # Conservative same-bar check (SL pehle, phir TGT)
+    e_hi = float(arr["high"][entry_idx])
+    e_lo = float(arr["low"][entry_idx])
+    if side == 1:
+        if e_lo <= sl:
+            exit_px, reason = sl, "SL"
+        elif tgt is not None and e_hi >= tgt:
+            exit_px, reason = tgt, "TGT"
+    else:
+        if e_hi >= sl:
+            exit_px, reason = sl, "SL"
+        elif tgt is not None and e_lo <= tgt:
+            exit_px, reason = tgt, "TGT"
+
+    if exit_px is None:
+        for k in range(entry_idx + 1, n):
+            sm = int(arr["smin"][k])
+            if sm > 910:  # last candle start 15:10 (15:15 square-off)
                 break
-            if hi >= tgt:
-                exit_px, reason = tgt, "TGT"
-                break
-        else:
-            if hi >= sl:
-                exit_px, reason = sl, "SL"
-                break
-            if lo <= tgt:
-                exit_px, reason = tgt, "TGT"
-                break
-        last_close = arr["close"][j]
+            hi = float(arr["high"][k])
+            lo = float(arr["low"][k])
+            cl = float(arr["close"][k])
+            vw = float(arr["vwap"][k])
+            if side == 1:
+                if lo <= sl:
+                    exit_px, reason = sl, "SL"
+                    break
+                if tgt is not None and hi >= tgt:
+                    exit_px, reason = tgt, "TGT"
+                    break
+                if p["vwap_exit"] and sm >= 600 and not np.isnan(vw) and cl < vw:
+                    exit_px, reason = cl, "VWAP"
+                    break
+            else:
+                if hi >= sl:
+                    exit_px, reason = sl, "SL"
+                    break
+                if tgt is not None and lo <= tgt:
+                    exit_px, reason = tgt, "TGT"
+                    break
+                if p["vwap_exit"] and sm >= 600 and not np.isnan(vw) and cl > vw:
+                    exit_px, reason = cl, "VWAP"
+                    break
+            last_close = cl
+
     if exit_px is None:
         exit_px = last_close
-    r_gross = (exit_px - entry) * side / risk
-    r_net = r_gross - (entry * COST_PCT / 100.0) / risk
-    sm = r["scan_min"]
+
+    r_gross = (exit_px - entry_px) * side / risk
+    r_net = r_gross - (entry_px * COST_PCT / 100.0) / risk
+    esm = int(arr["smin"][entry_idx])
     return dict(
-        date=str(r["date"]), time=f"{sm // 60:02d}:{sm % 60:02d}", sym=r["sym"],
-        side="LONG" if side == 1 else "SHORT", entry=round(entry, 2),
-        sl=round(sl, 2), target=round(tgt, 2), exit=round(exit_px, 2),
-        reason=reason, R=round(r_net, 3), bucket=bucket_of(sm),
+        date=str(s["date"]),
+        time=f"{esm // 60:02d}:{esm % 60:02d}",
+        sym=s["sym"],
+        side="LONG" if side == 1 else "SHORT",
+        rvol=round(s["rvol"], 2),
+        entry=round(entry_px, 2),
+        sl=round(sl, 2),
+        target=round(tgt, 2) if tgt is not None else "",
+        exit=round(exit_px, 2),
+        reason=reason,
+        R=round(r_net, 3),
+        bucket=bucket_of(esm),
     )
 
 
-def run_variant(records, days, p):
-    by_slot = defaultdict(list)
-    for r in records:
-        by_slot[(r["date"], r["scan_min"])].append(r)
-    trades, alerted = [], defaultdict(set)
-    for (dt, sm) in sorted(by_slot):
+def run_variant(setups, days, p):
+    by_day = defaultdict(list)
+    for s in setups:
+        by_day[s["date"]].append(s)
+    trades = []
+    for dt in sorted(by_day):
         cands = []
-        for r in by_slot[(dt, sm)]:
+        for s in by_day[dt]:
+            if s["rvol"] < p["rvol"]:
+                continue
             if p["nifty"]:
-                if r["bias"] == "BULL" and r["nifty"] <= -0.2:
+                if s["bias"] == "BULL" and s["nifty_open"] <= -0.2:
                     continue
-                if r["bias"] == "BEAR" and r["nifty"] >= 0.2:
+                if s["bias"] == "BEAR" and s["nifty_open"] >= 0.2:
                     continue
-            cands.append(r)
-        cands.sort(key=lambda x: -x["proj"])
-        cands = cands[:20]
-        sig = [r for r in cands
-               if r["sig"] and (not p["trend"] or r["trend_ok"])
-               and (r["bias"], r["sym"]) not in alerted[dt]]
-        sig.sort(key=lambda x: -x["proj"])
-        for r in sig[:5]:
-            alerted[dt].add((r["bias"], r["sym"]))
-            trades.append(simulate(r, days[(r["sym"], dt)], p))
+            cands.append(s)
+        cands.sort(key=lambda x: -x["rvol"])
+        for s in cands[:p["top_n"]]:
+            t = simulate(s, days[(s["sym"], dt)], p)
+            if t is not None:
+                trades.append(t)
     return trades
 
 
@@ -274,7 +319,10 @@ def stats(trades):
         return dict(n=0, win=0.0, avg=0.0, tot=0.0, pf=0.0, dd=0.0)
     R = np.array([t["R"] for t in trades])
     wins, losses = R[R > 0], R[R <= 0]
-    pf = wins.sum() / abs(losses.sum()) if losses.sum() < 0 else float("inf")
+    if losses.sum() < 0:
+        pf = wins.sum() / abs(losses.sum())
+    else:
+        pf = float("inf") if wins.sum() > 0 else 0.0
     cum = np.cumsum(R)
     dd = float((np.maximum.accumulate(cum) - cum).max())
     return dict(n=n, win=len(wins) / n * 100, avg=float(R.mean()), tot=float(R.sum()), pf=float(pf), dd=dd)
@@ -286,17 +334,18 @@ def fmt(s):
 
 
 def build_report(results, period_txt, n_syms, split_date):
-    lines = [f"BACKTEST {period_txt} | {n_syms} stocks | cost {COST_PCT}%", ""]
+    lines = [f"5m ORB BACKTEST {period_txt} | {n_syms} stocks | cost {COST_PCT}%", ""]
     for key, name, _ in VARIANTS:
         lines.append(f"{key} {name}: {fmt(stats(results[key]))}")
-    for key, name, _ in VARIANTS[:1] + VARIANTS[2:3]:
+
+    for key, name, _ in (VARIANTS[0], VARIANTS[3]):
         tr = results[key]
-        lines += ["", f"{key} {name} - time bucket:"]
-        for b in ("09:25-10:30", "10:30-12:00", "12:00-14:15"):
+        lines += ["", f"{key} {name} - entry time & side:"]
+        for b in ("09:20-09:45", "09:45-11:00", "11:00-14:00"):
             lines.append(f" {b}: {fmt(stats([t for t in tr if t['bucket'] == b]))}")
         for sd in ("LONG", "SHORT"):
             lines.append(f" {sd}: {fmt(stats([t for t in tr if t['side'] == sd]))}")
-    # ---- Out-of-sample split: pehla hissa vs baad ka hissa
+
     sd = str(split_date)
     lines += ["", f"SPLIT: H1 = {sd} se pehle, H2 = {sd} ya uske baad"]
     for key, name, _ in VARIANTS:
@@ -306,22 +355,19 @@ def build_report(results, period_txt, n_syms, split_date):
         lines.append(f"{key} {name}")
         lines.append(f" H1: {fmt(stats(h1))}")
         lines.append(f" H2: {fmt(stats(h2))}")
-    tr = results["C"]
-    combos = [
-        ("C + 10:30-12:00", lambda t: t["bucket"] == "10:30-12:00"),
-        ("C + SHORT", lambda t: t["side"] == "SHORT"),
-        ("C + SHORT + 10:30-12:00", lambda t: t["side"] == "SHORT" and t["bucket"] == "10:30-12:00"),
-    ]
-    for label, f in combos:
-        sel = [t for t in tr if f(t)]
+
+    for label, key, side in (("A + LONG", "A", "LONG"), ("A + SHORT", "A", "SHORT"),
+                             ("D + LONG", "D", "LONG"), ("D + SHORT", "D", "SHORT")):
+        sel = [t for t in results[key] if t["side"] == side]
         lines.append(label)
         lines.append(f" H1: {fmt(stats([t for t in sel if t['date'] < sd]))}")
         lines.append(f" H2: {fmt(stats([t for t in sel if t['date'] >= sd]))}")
-    best = [t for t in results["C"] if t["side"] == "SHORT" and t["bucket"] == "10:30-12:00"]
+
+    best_key = max(VARIANTS, key=lambda v: stats(results[v[0]])["tot"])[0]
     monthly = defaultdict(float)
-    for t in best:
+    for t in results[best_key]:
         monthly[t["date"][:7]] += t["R"]
-    lines += ["", "C+SHORT+10:30-12:00 mahine-wise R:"]
+    lines += ["", f"Best ({best_key}) mahine-wise R:"]
     lines.append(" ".join(f"{m[2:]}:{v:+.1f}" for m, v in sorted(monthly.items())))
     lines += ["", "R = risk ke multiple. DD = max drawdown (R). PF = profit factor."]
     return "\n".join(lines)
@@ -362,13 +408,13 @@ def main():
     if not data:
         raise SystemExit("Koi data nahi mila")
 
-    records, days = build_records(data, nifty_map, first_date)
-    print(f"Stage-1 records: {len(records)}")
+    setups, days = build_setups(data, nifty_map, first_date)
+    print(f"Total daily ORB setups (RVOL>=1.0): {len(setups)}")
 
     os.makedirs(OUT_DIR, exist_ok=True)
     results = {}
     for key, name, p in VARIANTS:
-        tr = run_variant(records, days, p)
+        tr = run_variant(setups, days, p)
         results[key] = tr
         pd.DataFrame(tr).to_csv(f"{OUT_DIR}/trades_{key}.csv", index=False)
 
@@ -381,6 +427,7 @@ def main():
     print(report)
     with open(f"{OUT_DIR}/summary.txt", "w") as f:
         f.write(report)
+
     chunk = ""
     for ln in report.split("\n"):
         if len(chunk) + len(ln) + 1 > 3800:
@@ -393,3 +440,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
