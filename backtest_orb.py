@@ -1,9 +1,9 @@
 """
-5m Opening Range Breakout (ORB) "Stocks in Play" backtest
-(Zarattini, Barbon & Aziz 2024 logic adapted for NSE 5m Fyers data).
+ICT / SMC Liquidity Sweep + MSS + FVG Backtest
+(PDH/PDL & Initial Balance 09:15-09:30 Liquidity Sweeps adapted for NSE 5m Fyers data).
 - Fyers se 5m candles leta hai (scanner.py ke get_fyers_token & send_telegram reuse karta hai)
-- Daily first 5m candle (09:15-09:20) ke RVOL par top Stocks-in-Play select karta hai
-- 5 filter/exit variants compare karta hai (A se E)
+- 60 NSE stocks par 5 mechanical ICT variants (A se E) + Nifty 50 standalone (N1, N2) compare karta hai
+- Strict zero-lookahead rules & conservative intrabar SL-first execution
 - Summary Telegram par bhejta hai, trades CSV backtest_out/ me save karta hai
 """
 import html
@@ -36,16 +36,16 @@ DEFAULT_SYMBOLS = [
 ]
 
 VARIANTS = [
-    ("A", "ORB Classic (RVOL>=1.5, OR-SL, EOD)",
-     dict(rvol=1.5, top_n=5, nifty=False, sl_mode="or", tgt_r=None, vwap_exit=False)),
-    ("B", "ORB ATR-SL (RVOL>=1.5, 0.25*ATR, EOD)",
-     dict(rvol=1.5, top_n=5, nifty=False, sl_mode="atr", tgt_r=None, vwap_exit=False)),
-    ("C", "ORB + 2.5R Target (RVOL>=1.5, OR-SL)",
-     dict(rvol=1.5, top_n=5, nifty=False, sl_mode="or", tgt_r=2.5, vwap_exit=False)),
-    ("D", "ORB Strict (RVOL>=2.0, Nifty, OR-SL, EOD)",
-     dict(rvol=2.0, top_n=5, nifty=True, sl_mode="or", tgt_r=None, vwap_exit=False)),
-    ("E", "ORB + VWAP Trail (RVOL>=1.5, Nifty, OR-SL)",
-     dict(rvol=1.5, top_n=5, nifty=True, sl_mode="or", tgt_r=None, vwap_exit=True)),
+    ("A", "ICT Classic (Sweep+MSS+FVG retest, 2.5R)",
+     dict(mode="fvg_retest", end_min=720, rvol=0.0, nifty=False, tgt_r=2.5, be_r=None, top_n=5)),
+    ("B", "ICT Killzone 3R (09:30-11:15, FVG retest)",
+     dict(mode="fvg_retest", end_min=675, rvol=0.0, nifty=False, tgt_r=3.0, be_r=None, top_n=5)),
+    ("C", "ICT Filtered (RVOL>=1.2 + Nifty, FVG 2.5R)",
+     dict(mode="fvg_retest", end_min=720, rvol=1.2, nifty=True, tgt_r=2.5, be_r=None, top_n=5)),
+    ("D", "Sweep Wick Reversal (09:30-11:15, 2R+BE@1R)",
+     dict(mode="sweep_wick", end_min=675, rvol=0.0, nifty=False, tgt_r=2.0, be_r=1.0, top_n=5)),
+    ("E", "ICT MSS Direct (No retest wait, 2.5R)",
+     dict(mode="mss_direct", end_min=690, rvol=1.2, nifty=True, tgt_r=2.5, be_r=None, top_n=5)),
 ]
 
 
@@ -97,27 +97,6 @@ def fetch_5m(fyers, fy_sym, start_dt, end_dt):
     return prepare(pd.concat(frames))
 
 
-def daily_orb_stats(df):
-    first_bar = df[df["smin"] == 555].groupby("date")["volume"].first()
-    d = df.groupby("date").agg(
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        vol=("volume", "sum"),
-        n=("ts", "count"),
-    ).sort_index()
-    d["open5_vol"] = first_bar
-    d["prev_close"] = d["close"].shift(1)
-    tr = pd.concat([
-        d["high"] - d["low"],
-        (d["high"] - d["prev_close"]).abs(),
-        (d["low"] - d["prev_close"]).abs(),
-    ], axis=1).max(axis=1)
-    d["atr14"] = tr.shift(1).rolling(14, min_periods=7).mean()
-    d["avg_open5_vol"] = d["open5_vol"].shift(1).rolling(14, min_periods=5).mean()
-    return d
-
-
 def build_nifty_map(ndf):
     if ndf is None or ndf.empty:
         return {}
@@ -131,184 +110,384 @@ def build_nifty_map(ndf):
     return m
 
 
-# ---------------------------------------------------------------- setups
-def build_setups(data, nifty_map, first_date):
-    """Har din 09:15-09:20 candle close par RVOL aur OR direction calculate karta hai."""
-    setups, days = [], {}
+def daily_levels(df):
+    d = df.groupby("date").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        vol=("volume", "sum"),
+        n=("ts", "count"),
+    ).sort_index()
+    d["pdh"] = d["high"].shift(1)
+    d["pdl"] = d["low"].shift(1)
+    d["prev_close"] = d["close"].shift(1)
+    d["avg14_vol"] = d["vol"].shift(1).rolling(14, min_periods=5).mean()
+    return d
+
+
+def build_day_cache(data, first_date, is_index=False):
+    cache = {}
     for sym, df in data.items():
-        ds = daily_orb_stats(df)
+        dl = daily_levels(df)
         for dt, g in df.groupby("date"):
-            if dt < first_date or dt not in ds.index:
+            if dt < first_date or dt not in dl.index:
                 continue
-            row = ds.loc[dt]
-            if (pd.isna(row["prev_close"]) or pd.isna(row["atr14"])
-                    or pd.isna(row["avg_open5_vol"]) or row["avg_open5_vol"] <= 0
-                    or row["atr14"] <= 0 or row["prev_close"] <= 100 or len(g) < 60):
+            row = dl.loc[dt]
+            if pd.isna(row["pdh"]) or pd.isna(row["pdl"]) or pd.isna(row["prev_close"]) or len(g) < 60:
                 continue
+            if not is_index:
+                if pd.isna(row["avg14_vol"]) or row["avg14_vol"] <= 0 or row["prev_close"] <= 100:
+                    continue
             g = g.reset_index(drop=True)
-            if int(g["smin"].iloc[0]) != 555:
+            ib = g[(g["smin"] >= 555) & (g["smin"] <= 565)]  # 09:15, 09:20, 09:25 -> IB complete at 09:30
+            if len(ib) < 3:
                 continue
-            o0 = float(g["open"].iloc[0])
-            h0 = float(g["high"].iloc[0])
-            l0 = float(g["low"].iloc[0])
-            c0 = float(g["close"].iloc[0])
-            v0 = float(g["volume"].iloc[0])
-            if c0 == o0 or v0 <= 0 or h0 <= l0:
+            ibh = float(ib["high"].max())
+            ibl = float(ib["low"].min())
+            arr = {k: g[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close", "volume", "cumvol", "vwap")}
+            arr["smin"] = g["smin"].to_numpy(dtype=int)
+            arr["pdh"] = float(row["pdh"])
+            arr["pdl"] = float(row["pdl"])
+            arr["prev_close"] = float(row["prev_close"])
+            arr["day_open"] = float(row["open"])
+            arr["ibh"] = ibh
+            arr["ibl"] = ibl
+            arr["avg14_vol"] = float(row["avg14_vol"]) if not pd.isna(row["avg14_vol"]) else 0.0
+            cache[(sym, dt)] = arr
+    return cache
+
+
+# ---------------------------------------------------------------- ICT detection
+def bucket_of(scan_min):
+    if scan_min < 630:
+        return "09:30-10:30"
+    if scan_min < 690:
+        return "10:30-11:30"
+    return "11:30-12:00+"
+
+
+def detect_signals_for_day(sym, dt, arr, p, nifty_map, is_index=False):
+    """
+    Har (sym, date) par pehla valid ICT setup detect karta hai (strictly causal).
+    """
+    o = arr["open"]
+    h = arr["high"]
+    l = arr["low"]
+    c = arr["close"]
+    smin = arr["smin"]
+    n = len(c)
+
+    mode = p["mode"]
+    end_min = p["end_min"]
+
+    # Index mean-reversion ke liye gap & IB range filters
+    gap_pct = abs(arr["day_open"] - arr["prev_close"]) / arr["prev_close"] * 100.0
+    if is_index and mode == "sweep_wick" and gap_pct > 1.0:
+        return None
+    ib_rng_pct = (arr["ibh"] - arr["ibl"]) / arr["day_open"] * 100.0
+    if is_index and mode == "sweep_wick" and ib_rng_pct > 0.75:
+        return None
+
+    min_sweep = 0.0005  # 0.05% minimum liquidity poke
+    max_sweep = 0.008 if is_index else 0.015
+    min_fvg = 0.0004 if is_index else 0.0006
+
+    # ---- Mode 1: Direct Liquidity Sweep + Rejection Wick
+    if mode == "sweep_wick":
+        for i in range(3, n - 1):
+            scan_min = int(smin[i]) + 5
+            if scan_min < 575 or scan_min > end_min:
                 continue
-            rvol = v0 / float(row["avg_open5_vol"])
-            if rvol < 1.0:
+            rng = h[i] - l[i]
+            if rng <= 0:
                 continue
-            arr = {k: g[k].to_numpy() for k in ("open", "high", "low", "close", "smin", "vwap")}
-            days[(sym, dt)] = arr
-            setups.append(dict(
-                date=dt,
-                sym=sym,
-                bias="BULL" if c0 > o0 else "BEAR",
-                rvol=rvol,
-                o0=o0,
-                h0=h0,
-                l0=l0,
-                c0=c0,
-                atr14=float(row["atr14"]),
-                nifty_open=nifty_map.get((dt, 555), 0.0),
-            ))
-    return setups, days
+            upper_wick = (h[i] - max(o[i], c[i])) / rng
+            lower_wick = (min(o[i], c[i]) - l[i]) / rng
+
+            side = 0
+            sweep_ext = None
+            lvl_tag = ""
+            for lvl, tag in ((arr["ibh"], "IBH"), (arr["pdh"], "PDH")):
+                depth = (h[i] - lvl) / lvl
+                if min_sweep <= depth <= max_sweep and c[i] < lvl and upper_wick >= 0.25:
+                    if c[i - 1] <= lvl * 1.001:
+                        side = -1
+                        sweep_ext = h[i]
+                        lvl_tag = tag
+                        break
+
+            if side == 0:
+                for lvl, tag in ((arr["ibl"], "IBL"), (arr["pdl"], "PDL")):
+                    depth = (lvl - l[i]) / lvl
+                    if min_sweep <= depth <= max_sweep and c[i] > lvl and lower_wick >= 0.25:
+                        if c[i - 1] >= lvl * 0.999:
+                            side = 1
+                            sweep_ext = l[i]
+                            lvl_tag = tag
+                            break
+
+            if side == 0:
+                continue
+            if not _pass_filters(sym, dt, arr, i, side, p, nifty_map, is_index):
+                continue
+
+            entry = float(c[i])
+            buf = entry * 0.0005
+            raw_risk = (entry - (sweep_ext - buf)) if side == 1 else ((sweep_ext + buf) - entry)
+            return dict(
+                sym=sym, dt=dt, entry_idx=i, fill_on_open_bar=False,
+                scan_min=scan_min, side=side, entry=entry,
+                raw_risk=raw_risk, score=_score(arr, i, is_index),
+                tag=f"SWEEP_{lvl_tag}",
+            )
+        return None
+
+    # ---- Mode 2 & 3: ICT Liquidity Sweep -> MSS + FVG (Retest ya Direct)
+    active_sweep = None
+    pending_fvg = None
+
+    for i in range(3, n - 1):
+        scan_min = int(smin[i]) + 5
+        if scan_min < 575:
+            continue
+
+        # 1. Check pending FVG limit order on candle i (strictly causal)
+        if pending_fvg is not None:
+            if i - pending_fvg["fvg_idx"] > 8 or scan_min > end_min + 30:
+                pending_fvg = None
+            else:
+                side = pending_fvg["side"]
+                fvg_lvl = pending_fvg["fvg_entry"]
+                sweep_ext = pending_fvg["sweep_ext"]
+                if side == -1:
+                    if o[i] >= sweep_ext:
+                        pending_fvg = None
+                    elif h[i] >= fvg_lvl:
+                        entry = max(float(o[i]), fvg_lvl)
+                        buf = entry * 0.0005
+                        raw_risk = (sweep_ext + buf) - entry
+                        return dict(
+                            sym=sym, dt=dt, entry_idx=i, fill_on_open_bar=True,
+                            scan_min=scan_min, side=side, entry=entry,
+                            raw_risk=raw_risk, score=pending_fvg["score"],
+                            tag=f"FVG_{pending_fvg['tag']}",
+                        )
+                else:
+                    if o[i] <= sweep_ext:
+                        pending_fvg = None
+                    elif l[i] <= fvg_lvl:
+                        entry = min(float(o[i]), fvg_lvl)
+                        buf = entry * 0.0005
+                        raw_risk = entry - (sweep_ext - buf)
+                        return dict(
+                            sym=sym, dt=dt, entry_idx=i, fill_on_open_bar=True,
+                            scan_min=scan_min, side=side, entry=entry,
+                            raw_risk=raw_risk, score=pending_fvg["score"],
+                            tag=f"FVG_{pending_fvg['tag']}",
+                        )
+
+        if scan_min > end_min:
+            continue
+
+        # 2. Check for new liquidity sweep on candle i
+        for lvl, tag in ((arr["ibh"], "IBH"), (arr["pdh"], "PDH")):
+            depth = (h[i] - lvl) / lvl
+            if min_sweep <= depth <= max_sweep and l[i] < lvl:
+                mss_lvl = float(l[max(0, i - 3):i + 1].min())
+                active_sweep = dict(
+                    side=-1, sweep_idx=i, sweep_ext=float(h[i]),
+                    mss_lvl=mss_lvl, tag=tag,
+                )
+                break
+        else:
+            for lvl, tag in ((arr["ibl"], "IBL"), (arr["pdl"], "PDL")):
+                depth = (lvl - l[i]) / lvl
+                if min_sweep <= depth <= max_sweep and h[i] > lvl:
+                    mss_lvl = float(h[max(0, i - 3):i + 1].max())
+                    active_sweep = dict(
+                        side=1, sweep_idx=i, sweep_ext=float(l[i]),
+                        mss_lvl=mss_lvl, tag=tag,
+                    )
+                    break
+
+        # 3. Look for MSS + FVG within 6 candles of sweep
+        if active_sweep is not None and i > active_sweep["sweep_idx"]:
+            if i - active_sweep["sweep_idx"] > 6:
+                active_sweep = None
+                continue
+
+            side = active_sweep["side"]
+            if side == -1:
+                active_sweep["sweep_ext"] = max(active_sweep["sweep_ext"], float(h[i]))
+            else:
+                active_sweep["sweep_ext"] = min(active_sweep["sweep_ext"], float(l[i]))
+
+            if i < 2:
+                continue
+
+            if side == -1:
+                mss_ok = c[i] < active_sweep["mss_lvl"]
+                fvg_gap = l[i - 2] - h[i]
+                fvg_ok = (fvg_gap / c[i]) >= min_fvg
+                fvg_entry = float(h[i])
+            else:
+                mss_ok = c[i] > active_sweep["mss_lvl"]
+                fvg_gap = l[i] - h[i - 2]
+                fvg_ok = (fvg_gap / c[i]) >= min_fvg
+                fvg_entry = float(l[i])
+
+            if mss_ok and fvg_ok:
+                if not _pass_filters(sym, dt, arr, i, side, p, nifty_map, is_index):
+                    active_sweep = None
+                    continue
+
+                if mode == "mss_direct":
+                    entry = float(c[i])
+                    buf = entry * 0.0005
+                    sweep_ext = active_sweep["sweep_ext"]
+                    raw_risk = (entry - (sweep_ext - buf)) if side == 1 else ((sweep_ext + buf) - entry)
+                    return dict(
+                        sym=sym, dt=dt, entry_idx=i, fill_on_open_bar=False,
+                        scan_min=scan_min, side=side, entry=entry,
+                        raw_risk=raw_risk, score=_score(arr, i, is_index),
+                        tag=f"MSS_{active_sweep['tag']}",
+                    )
+                else:
+                    pending_fvg = dict(
+                        side=side, fvg_idx=i, fvg_entry=fvg_entry,
+                        sweep_ext=active_sweep["sweep_ext"], tag=active_sweep["tag"],
+                        score=_score(arr, i, is_index),
+                    )
+                    active_sweep = None
+
+    return None
+
+
+def _score(arr, i, is_index):
+    if is_index or arr["avg14_vol"] <= 0:
+        return 1.0
+    scan_min = int(arr["smin"][i]) + 5
+    elapsed = max(min((scan_min - 555) / 375.0, 1.0), 0.04)
+    return float(arr["cumvol"][i]) / arr["avg14_vol"] / elapsed
+
+
+def _pass_filters(sym, dt, arr, i, side, p, nifty_map, is_index):
+    if not is_index and p["rvol"] > 0:
+        if _score(arr, i, is_index) < p["rvol"]:
+            return False
+    if not is_index and p["nifty"]:
+        n_chg = nifty_map.get((dt, int(arr["smin"][i])), 0.0)
+        if side == 1 and n_chg <= -0.2:
+            return False
+        if side == -1 and n_chg >= 0.2:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------- simulate
-def bucket_of(smin):
-    if smin < 585:
-        return "09:20-09:45"
-    if smin < 660:
-        return "09:45-11:00"
-    return "11:00-14:00"
-
-
-def simulate(s, arr, p):
-    side = 1 if s["bias"] == "BULL" else -1
-    trigger = s["h0"] if side == 1 else s["l0"]
-    n = len(arr["close"])
-
-    entry_idx, entry_px = None, None
-    for j in range(1, n):
-        sm = int(arr["smin"][j])
-        if sm > 840:  # 14:00 ke baad naya breakout entry nahi
-            break
-        o = float(arr["open"][j])
-        hi = float(arr["high"][j])
-        lo = float(arr["low"][j])
-        if side == 1 and hi >= trigger:
-            entry_idx = j
-            entry_px = max(o, trigger)
-            break
-        if side == -1 and lo <= trigger:
-            entry_idx = j
-            entry_px = min(o, trigger)
-            break
-
-    if entry_idx is None:
+def simulate(sig, arr, p, is_index=False):
+    entry = sig["entry"]
+    side = sig["side"]
+    raw_risk = sig["raw_risk"]
+    if raw_risk <= 0:
         return None
 
-    if p["sl_mode"] == "or":
-        sl0 = s["l0"] if side == 1 else s["h0"]
-        risk = max(abs(entry_px - sl0), entry_px * 0.0025, 0.5)
-    else:
-        risk = max(0.25 * s["atr14"], entry_px * 0.0025, 0.5)
+    min_pct = 0.0012 if is_index else 0.0035
+    max_pct = 0.006 if is_index else 0.020
+    if raw_risk > entry * max_pct:
+        return None
+    risk = max(raw_risk, entry * min_pct, 0.5)
 
-    sl = entry_px - side * risk
-    tgt = (entry_px + side * risk * p["tgt_r"]) if p["tgt_r"] else None
+    sl = entry - side * risk
+    cur_sl = sl
+    tgt = entry + side * risk * p["tgt_r"]
+    be_trigger = (entry + side * risk * p["be_r"]) if p["be_r"] else None
+    be_armed = False
 
     exit_px, reason = None, "EOD"
-    last_close = float(arr["close"][entry_idx])
+    n = len(arr["close"])
+    idx = sig["entry_idx"]
+    last_close = float(arr["close"][idx])
 
-    # Conservative same-bar check (SL pehle, phir TGT)
-    e_hi = float(arr["high"][entry_idx])
-    e_lo = float(arr["low"][entry_idx])
-    if side == 1:
-        if e_lo <= sl:
-            exit_px, reason = sl, "SL"
-        elif tgt is not None and e_hi >= tgt:
-            exit_px, reason = tgt, "TGT"
-    else:
-        if e_hi >= sl:
-            exit_px, reason = sl, "SL"
-        elif tgt is not None and e_lo <= tgt:
-            exit_px, reason = tgt, "TGT"
+    # Conservative same-bar SL check for limit fills
+    if sig["fill_on_open_bar"]:
+        hi, lo = float(arr["high"][idx]), float(arr["low"][idx])
+        if side == 1 and lo <= cur_sl:
+            exit_px, reason = cur_sl, "SL"
+        elif side == -1 and hi >= cur_sl:
+            exit_px, reason = cur_sl, "SL"
 
     if exit_px is None:
-        for k in range(entry_idx + 1, n):
-            sm = int(arr["smin"][k])
-            if sm > 910:  # last candle start 15:10 (15:15 square-off)
+        for j in range(idx + 1, n):
+            if int(arr["smin"][j]) > 910:  # 15:15 square-off
                 break
-            hi = float(arr["high"][k])
-            lo = float(arr["low"][k])
-            cl = float(arr["close"][k])
-            vw = float(arr["vwap"][k])
+            hi = float(arr["high"][j])
+            lo = float(arr["low"][j])
+            cl = float(arr["close"][j])
+
             if side == 1:
-                if lo <= sl:
-                    exit_px, reason = sl, "SL"
+                if lo <= cur_sl:
+                    exit_px, reason = cur_sl, ("BE" if be_armed else "SL")
                     break
-                if tgt is not None and hi >= tgt:
+                if hi >= tgt:
                     exit_px, reason = tgt, "TGT"
                     break
-                if p["vwap_exit"] and sm >= 600 and not np.isnan(vw) and cl < vw:
-                    exit_px, reason = cl, "VWAP"
-                    break
+                if be_trigger is not None and (not be_armed) and hi >= be_trigger:
+                    cur_sl = entry
+                    be_armed = True
             else:
-                if hi >= sl:
-                    exit_px, reason = sl, "SL"
+                if hi >= cur_sl:
+                    exit_px, reason = cur_sl, ("BE" if be_armed else "SL")
                     break
-                if tgt is not None and lo <= tgt:
+                if lo <= tgt:
                     exit_px, reason = tgt, "TGT"
                     break
-                if p["vwap_exit"] and sm >= 600 and not np.isnan(vw) and cl > vw:
-                    exit_px, reason = cl, "VWAP"
-                    break
+                if be_trigger is not None and (not be_armed) and lo <= be_trigger:
+                    cur_sl = entry
+                    be_armed = True
             last_close = cl
 
     if exit_px is None:
         exit_px = last_close
 
-    r_gross = (exit_px - entry_px) * side / risk
-    r_net = r_gross - (entry_px * COST_PCT / 100.0) / risk
-    esm = int(arr["smin"][entry_idx])
+    r_gross = (exit_px - entry) * side / risk
+    r_net = r_gross - (entry * COST_PCT / 100.0) / risk
+    sm = sig["scan_min"]
     return dict(
-        date=str(s["date"]),
-        time=f"{esm // 60:02d}:{esm % 60:02d}",
-        sym=s["sym"],
+        date=str(sig["dt"]),
+        time=f"{sm // 60:02d}:{sm % 60:02d}",
+        sym=sig["sym"],
         side="LONG" if side == 1 else "SHORT",
-        rvol=round(s["rvol"], 2),
-        entry=round(entry_px, 2),
+        setup=sig["tag"],
+        entry=round(entry, 2),
         sl=round(sl, 2),
-        target=round(tgt, 2) if tgt is not None else "",
+        target=round(tgt, 2),
         exit=round(exit_px, 2),
         reason=reason,
         R=round(r_net, 3),
-        bucket=bucket_of(esm),
+        bucket=bucket_of(sm),
     )
 
 
-def run_variant(setups, days, p):
+def run_variant(cache, nifty_map, p, is_index=False):
     by_day = defaultdict(list)
-    for s in setups:
-        by_day[s["date"]].append(s)
+    for (sym, dt), arr in cache.items():
+        sig = detect_signals_for_day(sym, dt, arr, p, nifty_map, is_index=is_index)
+        if sig is not None:
+            by_day[dt].append(sig)
+
     trades = []
     for dt in sorted(by_day):
-        cands = []
-        for s in by_day[dt]:
-            if s["rvol"] < p["rvol"]:
-                continue
-            if p["nifty"]:
-                if s["bias"] == "BULL" and s["nifty_open"] <= -0.2:
-                    continue
-                if s["bias"] == "BEAR" and s["nifty_open"] >= 0.2:
-                    continue
-            cands.append(s)
-        cands.sort(key=lambda x: -x["rvol"])
-        for s in cands[:p["top_n"]]:
-            t = simulate(s, days[(s["sym"], dt)], p)
+        sigs = sorted(by_day[dt], key=lambda x: (x["scan_min"], -x["score"]))
+        taken = 0
+        for s in sigs:
+            if taken >= p["top_n"]:
+                break
+            t = simulate(s, cache[(s["sym"], dt)], p, is_index=is_index)
             if t is not None:
                 trades.append(t)
+                taken += 1
     return trades
 
 
@@ -333,111 +512,13 @@ def fmt(s):
     return f"n={s['n']} win={s['win']:.0f}% avgR={s['avg']:+.2f} totR={s['tot']:+.1f} PF={pf} DD={s['dd']:.1f}R"
 
 
-def build_report(results, period_txt, n_syms, split_date):
-    lines = [f"5m ORB BACKTEST {period_txt} | {n_syms} stocks | cost {COST_PCT}%", ""]
+def build_report(results, nifty_res, period_txt, n_syms, split_date):
+    lines = [f"ICT / SMC BACKTEST {period_txt} | {n_syms} stocks | cost {COST_PCT}%", ""]
+    lines.append("=== 60 NSE STOCKS ===")
     for key, name, _ in VARIANTS:
         lines.append(f"{key} {name}: {fmt(stats(results[key]))}")
 
-    for key, name, _ in (VARIANTS[0], VARIANTS[3]):
-        tr = results[key]
-        lines += ["", f"{key} {name} - entry time & side:"]
-        for b in ("09:20-09:45", "09:45-11:00", "11:00-14:00"):
-            lines.append(f" {b}: {fmt(stats([t for t in tr if t['bucket'] == b]))}")
-        for sd in ("LONG", "SHORT"):
-            lines.append(f" {sd}: {fmt(stats([t for t in tr if t['side'] == sd]))}")
-
-    sd = str(split_date)
-    lines += ["", f"SPLIT: H1 = {sd} se pehle, H2 = {sd} ya uske baad"]
-    for key, name, _ in VARIANTS:
-        tr = results[key]
-        h1 = [t for t in tr if t["date"] < sd]
-        h2 = [t for t in tr if t["date"] >= sd]
-        lines.append(f"{key} {name}")
-        lines.append(f" H1: {fmt(stats(h1))}")
-        lines.append(f" H2: {fmt(stats(h2))}")
-
-    for label, key, side in (("A + LONG", "A", "LONG"), ("A + SHORT", "A", "SHORT"),
-                             ("D + LONG", "D", "LONG"), ("D + SHORT", "D", "SHORT")):
-        sel = [t for t in results[key] if t["side"] == side]
-        lines.append(label)
-        lines.append(f" H1: {fmt(stats([t for t in sel if t['date'] < sd]))}")
-        lines.append(f" H2: {fmt(stats([t for t in sel if t['date'] >= sd]))}")
-
-    best_key = max(VARIANTS, key=lambda v: stats(results[v[0]])["tot"])[0]
-    monthly = defaultdict(float)
-    for t in results[best_key]:
-        monthly[t["date"][:7]] += t["R"]
-    lines += ["", f"Best ({best_key}) mahine-wise R:"]
-    lines.append(" ".join(f"{m[2:]}:{v:+.1f}" for m, v in sorted(monthly.items())))
-    lines += ["", "R = risk ke multiple. DD = max drawdown (R). PF = profit factor."]
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------- main
-def main():
-    from fyers_apiv3 import fyersModel
-    from scanner import get_fyers_token, send_telegram
-
-    now = datetime.now(IST)
-    start_dt = now - timedelta(days=BACKTEST_DAYS + WARMUP_DAYS)
-    first_date = (now - timedelta(days=BACKTEST_DAYS)).date()
-
-    app_id = os.environ["FYERS_APP_ID"].strip()
-    token = get_fyers_token(now.strftime("%Y-%m-%d"))
-    fyers = fyersModel.FyersModel(client_id=app_id, token=token, log_path="")
-
-    if os.getenv("SYMBOLS"):
-        symbols = [s.strip().upper() for s in os.getenv("SYMBOLS").split(",") if s.strip()]
-    elif os.path.exists("symbols.txt"):
-        symbols = [s.strip().upper() for s in open("symbols.txt") if s.strip()]
-    else:
-        symbols = DEFAULT_SYMBOLS
-
-    print("Nifty fetch...")
-    ndf = fetch_5m(fyers, "NSE:NIFTY50-INDEX", start_dt, now)
-    nifty_map = build_nifty_map(ndf)
-    if not nifty_map:
-        print("WARNING: Nifty data nahi mila, Nifty filter kaam nahi karega")
-
-    data = {}
-    for k, s in enumerate(symbols, 1):
-        print(f"[{k}/{len(symbols)}] {s}")
-        df = fetch_5m(fyers, f"NSE:{s}-EQ", start_dt, now)
-        if df is not None and not df.empty:
-            data[s] = df
-    if not data:
-        raise SystemExit("Koi data nahi mila")
-
-    setups, days = build_setups(data, nifty_map, first_date)
-    print(f"Total daily ORB setups (RVOL>=1.0): {len(setups)}")
-
-    os.makedirs(OUT_DIR, exist_ok=True)
-    results = {}
-    for key, name, p in VARIANTS:
-        tr = run_variant(setups, days, p)
-        results[key] = tr
-        pd.DataFrame(tr).to_csv(f"{OUT_DIR}/trades_{key}.csv", index=False)
-
-    sd_env = os.getenv("SPLIT_DATE", "").strip()
-    if sd_env:
-        split_date = datetime.strptime(sd_env, "%Y-%m-%d").date()
-    else:
-        split_date = first_date + (now.date() - first_date) / 2
-    report = build_report(results, f"{first_date} se {now.date()}", len(data), split_date)
-    print(report)
-    with open(f"{OUT_DIR}/summary.txt", "w") as f:
-        f.write(report)
-
-    chunk = ""
-    for ln in report.split("\n"):
-        if len(chunk) + len(ln) + 1 > 3800:
-            send_telegram(html.escape(chunk))
-            chunk = ""
-        chunk += ln + "\n"
-    if chunk.strip():
-        send_telegram(html.escape(chunk))
-
-
-if __name__ == "__main__":
-    main()
-    
+    if nifty_res:
+        lines += ["", "=== NIFTY 50 INDEX (STANDALONE) ==="]
+        for label, tr in nifty_res:
+            lines.append(f"{label}: {fmt(stats(tr))}")
