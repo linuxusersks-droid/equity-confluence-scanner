@@ -1,8 +1,16 @@
-name: Backtest 5m VWAP
+name: Backtest Runner
 
 on:
   workflow_dispatch:
     inputs:
+      strategy:
+        description: 'Kaunsi strategy chalani hai'
+        required: true
+        default: 'backtest_orb.py'
+        type: choice
+        options:
+          - backtest_orb.py
+          - backtest_5m_vwap.py
       days:
         description: 'Kitne din ka backtest (default 180)'
         required: false
@@ -34,7 +42,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BACKTEST_DAYS: ${{ inputs.days }}
-        run: python backtest_5m_vwap.py
+        run: python ${{ inputs.strategy }}
 
       - name: Save results
         if: always()
@@ -42,3 +50,4 @@ jobs:
         with:
           name: backtest-results
           path: backtest_out/
+          
