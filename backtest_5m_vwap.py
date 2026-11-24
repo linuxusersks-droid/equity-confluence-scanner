@@ -4,6 +4,7 @@
 - Alag-alag filter variants compare karta hai
 - Summary Telegram par bhejta hai, trades CSV backtest_out/ me save karta hai
 """
+import html
 import os
 import sys
 import time
@@ -297,7 +298,7 @@ def build_report(results, period_txt, n_syms, split_date):
             lines.append(f" {sd}: {fmt(stats([t for t in tr if t['side'] == sd]))}")
     # ---- Out-of-sample split: pehla hissa vs baad ka hissa
     sd = str(split_date)
-    lines += ["", f"SPLIT: pehla hissa (< {sd}) vs baad ka hissa (>= {sd})"]
+    lines += ["", f"SPLIT: H1 = {sd} se pehle, H2 = {sd} ya uske baad"]
     for key, name, _ in VARIANTS:
         tr = results[key]
         h1 = [t for t in tr if t["date"] < sd]
@@ -316,6 +317,12 @@ def build_report(results, period_txt, n_syms, split_date):
         lines.append(label)
         lines.append(f" H1: {fmt(stats([t for t in sel if t['date'] < sd]))}")
         lines.append(f" H2: {fmt(stats([t for t in sel if t['date'] >= sd]))}")
+    best = [t for t in results["C"] if t["side"] == "SHORT" and t["bucket"] == "10:30-12:00"]
+    monthly = defaultdict(float)
+    for t in best:
+        monthly[t["date"][:7]] += t["R"]
+    lines += ["", "C+SHORT+10:30-12:00 mahine-wise R:"]
+    lines.append(" ".join(f"{m[2:]}:{v:+.1f}" for m, v in sorted(monthly.items())))
     lines += ["", "R = risk ke multiple. DD = max drawdown (R). PF = profit factor."]
     return "\n".join(lines)
 
@@ -365,7 +372,11 @@ def main():
         results[key] = tr
         pd.DataFrame(tr).to_csv(f"{OUT_DIR}/trades_{key}.csv", index=False)
 
-    split_date = first_date + (now.date() - first_date) / 2
+    sd_env = os.getenv("SPLIT_DATE", "").strip()
+    if sd_env:
+        split_date = datetime.strptime(sd_env, "%Y-%m-%d").date()
+    else:
+        split_date = first_date + (now.date() - first_date) / 2
     report = build_report(results, f"{first_date} se {now.date()}", len(data), split_date)
     print(report)
     with open(f"{OUT_DIR}/summary.txt", "w") as f:
@@ -373,13 +384,12 @@ def main():
     chunk = ""
     for ln in report.split("\n"):
         if len(chunk) + len(ln) + 1 > 3800:
-            send_telegram(chunk)
+            send_telegram(html.escape(chunk))
             chunk = ""
         chunk += ln + "\n"
     if chunk.strip():
-        send_telegram(chunk)
+        send_telegram(html.escape(chunk))
 
 
 if __name__ == "__main__":
     main()
-                           
