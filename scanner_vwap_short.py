@@ -1,20 +1,25 @@
 """
-Clean Signal-Only Live Scanner: VWAP C + SHORT (09:25 - 12:00 IST)
+Standalone Live Scanner: VWAP C + SHORT (09:25 - 12:00 IST)
+- 100% self-contained: built-in Fyers v3 TOTP login + Telegram (no scanner.py needed)
 - Sirf SHORT signals (09:25 se 12:00 IST)
 - Rules: Nifty < +0.2%, Stock <= -1.0% & < Day Open, RVOL >= 1.5x,
   3/4 prior candles < VWAP + lower high, red VWAP rejection candle
 - SL: max(candle high, VWAP) + 0.3% | Target: 2.5R | EOD exit: 3:15 PM
-- Reuses get_fyers_token & send_telegram from scanner.py
 """
+import base64
+import hashlib
 import html
 import json
 import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import pandas as pd
+import pyotp
+import requests
 
 IST = timezone(timedelta(hours=5, minutes=30))
 COLS = ["ts", "open", "high", "low", "close", "volume"]
@@ -40,6 +45,135 @@ DEFAULT_SYMBOLS = [
 ]
 
 
+# ---------------- Standalone Auth & Telegram ----------------
+def send_telegram(msg):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("Telegram secrets missing, console only.")
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"Telegram HTTP {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+
+def get_fyers_token(today_str=""):
+    cache_file = ".fyers_token_cache.json"
+    if today_str and os.path.exists(cache_file):
+        try:
+            c = json.load(open(cache_file, "r", encoding="utf-8"))
+            if c.get("date") == today_str and c.get("token"):
+                return c["token"]
+        except Exception:
+            pass
+
+    app_id = os.environ["FYERS_APP_ID"].strip()
+    secret_key = os.environ["FYERS_SECRET_KEY"].strip()
+    fy_id = os.environ["FYERS_ID"].strip()
+    pin = os.environ["FYERS_PIN"].strip()
+    totp_key = os.environ["FYERS_TOTP_KEY"].strip()
+
+    s = requests.Session()
+    b64 = lambda x: base64.b64encode(x.encode()).decode()
+
+    r1 = s.post(
+        "https://api-t2.fyers.in/vagator/v2/send_login_otp_v2",
+        json={"fy_id": b64(fy_id), "app_id": "2"},
+        timeout=20,
+    ).json()
+    req_key = r1.get("request_key")
+    if not req_key:
+        raise RuntimeError(f"Fyers OTP init failed: {r1}")
+
+    r2 = s.post(
+        "https://api-t2.fyers.in/vagator/v2/verify_otp",
+        json={"request_key": req_key, "otp": pyotp.TOTP(totp_key).now()},
+        timeout=20,
+    ).json()
+    req_key = r2.get("request_key")
+    if not req_key:
+        raise RuntimeError(f"Fyers TOTP verify failed: {r2}")
+
+    r3 = s.post(
+        "https://api-t2.fyers.in/vagator/v2/verify_pin_v2",
+        json={"request_key": req_key, "identity_type": "pin", "identifier": b64(pin)},
+        timeout=20,
+    ).json()
+    bearer = (r3.get("data") or {}).get("access_token")
+    if not bearer:
+        raise RuntimeError(f"Fyers PIN verify failed: {r3}")
+
+    app_prefix = app_id.split("-")[0]
+    app_type = app_id.split("-")[1] if "-" in app_id else "100"
+    redirect_candidates = []
+    if os.getenv("FYERS_REDIRECT_URI"):
+        redirect_candidates.append(os.getenv("FYERS_REDIRECT_URI").strip())
+    redirect_candidates += [
+        "https://trade.fyers.in/api-login/redirect-uri/index.html",
+        "https://www.google.com",
+        "https://www.google.com/",
+        "https://127.0.0.1:5000",
+        "https://127.0.0.1",
+        "https://fyers.in",
+    ]
+
+    auth_code = None
+    last_err = None
+    for redir in redirect_candidates:
+        r4 = s.post(
+            "https://api-t1.fyers.in/api/v3/token",
+            headers={"Authorization": f"Bearer {bearer}"},
+            json={
+                "fyers_id": fy_id,
+                "app_id": app_prefix,
+                "redirect_uri": redir,
+                "appType": app_type,
+                "code_challenge": "",
+                "state": "None",
+                "scope": "",
+                "nonce": "",
+                "response_type": "code",
+                "create_cookie": True,
+            },
+            allow_redirects=False,
+            timeout=20,
+        ).json()
+        url = r4.get("Url") or ""
+        qs = parse_qs(urlparse(url).query)
+        if "auth_code" in qs:
+            auth_code = qs["auth_code"][0]
+            break
+        last_err = r4
+
+    if not auth_code:
+        raise RuntimeError(f"Fyers auth_code failed (set FYERS_REDIRECT_URI): {last_err}")
+
+    app_hash = hashlib.sha256(f"{app_id}:{secret_key}".encode()).hexdigest()
+    r5 = s.post(
+        "https://api-t1.fyers.in/api/v3/validate-authcode",
+        json={"grant_type": "authorization_code", "appIdHash": app_hash, "code": auth_code},
+        timeout=20,
+    ).json()
+    token = r5.get("access_token")
+    if not token:
+        raise RuntimeError(f"Fyers token exchange failed: {r5}")
+
+    if today_str:
+        try:
+            json.dump({"date": today_str, "token": token}, open(cache_file, "w", encoding="utf-8"))
+        except Exception:
+            pass
+    return token
+
+
+# ---------------- Data & Strategy ----------------
 def prepare_df(candles):
     if not candles:
         return None
@@ -122,37 +256,31 @@ def find_signal(sym, df, today, latest_smin, nifty_map):
         if np.isnan(vw[i]) or vw[i] <= 0:
             continue
 
-        # 1. Nifty filter
         n_chg = nifty_map.get(sm, 0.0)
         if n_chg >= 0.2:
             continue
 
-        # 2. Stock weakness
         chg_pct = (c[i] - prev_close) / prev_close * 100.0
         if chg_pct > -1.0 or c[i] >= day_open:
             continue
 
-        # 3. Projected RVOL >= 1.5x
         elapsed = max(min((scan_min - 555) / 375.0, 1.0), 0.04)
         rvol = cv[i] / avg10_vol / elapsed
         if rvol < 1.5:
             continue
 
-        # 4. VWAP downtrend (3/4 prior candles < VWAP + lower high)
         p0 = max(0, i - 4)
         if int(np.sum(c[p0:i] < vw[p0:i])) < min(3, i - p0):
             continue
         if h[i] > float(np.max(h[p0:i])) * 1.0005:
             continue
 
-        # 5. Red VWAP rejection candle
         if c[i] >= o[i]:
             continue
         dist_pct = (vw[i] - c[i]) / vw[i] * 100.0
         if not (0.02 <= dist_pct <= 0.45) or h[i] < vw[i] * 0.9985:
             continue
 
-        # 6. Levels
         entry = float(c[i])
         sl = max(float(h[i]), float(vw[i])) * 1.003
         risk = sl - entry
@@ -190,8 +318,7 @@ def load_state(today_str):
 
 def save_state(state):
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
+        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
     except Exception:
         pass
 
@@ -217,7 +344,7 @@ def get_symbols():
     return DEFAULT_SYMBOLS
 
 
-def run_once(fyers, send_telegram, now_dt=None):
+def run_once(fyers, now_dt=None):
     now_dt = now_dt or datetime.now(IST)
     today = now_dt.date()
     cur_min = now_dt.hour * 60 + now_dt.minute
@@ -264,7 +391,6 @@ def run_once(fyers, send_telegram, now_dt=None):
 
 def main():
     from fyers_apiv3 import fyersModel
-    from scanner import get_fyers_token, send_telegram
 
     now = datetime.now(IST)
     fyers = fyersModel.FyersModel(
@@ -274,7 +400,7 @@ def main():
     )
 
     if RUN_MODE != "loop" and "--loop" not in sys.argv:
-        run_once(fyers, send_telegram, now)
+        run_once(fyers, now)
         return
 
     print("VWAP C SHORT scanner started (LOOP mode, 09:25-12:00 IST)...")
@@ -286,7 +412,7 @@ def main():
             break
         if cur_min >= START_MIN:
             try:
-                run_once(fyers, send_telegram, now)
+                run_once(fyers, now)
             except Exception as e:
                 print(f"Cycle error (retrying next bar): {e}")
         now = datetime.now(IST)
@@ -296,4 +422,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+      
