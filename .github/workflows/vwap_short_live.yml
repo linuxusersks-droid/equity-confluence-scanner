@@ -1,0 +1,30 @@
+name: VWAP C SHORT Live
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '55 3 * * 1-5'
+    - cron: '*/5 4-5 * * 1-5'
+    - cron: '0,5,10,15,20,25,30 6 * * 1-5'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install fyers-apiv3 pyotp pandas numpy requests
+      - name: Run Scanner
+        env:
+          FYERS_APP_ID: ${{ secrets.FYERS_APP_ID }}
+          FYERS_SECRET_KEY: ${{ secrets.FYERS_SECRET_KEY }}
+          FYERS_ID: ${{ secrets.FYERS_ID }}
+          FYERS_PIN: ${{ secrets.FYERS_PIN }}
+          FYERS_TOTP_KEY: ${{ secrets.FYERS_TOTP_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_SIGNALS: '5'
+        run: python scanner_vwap_short.py
